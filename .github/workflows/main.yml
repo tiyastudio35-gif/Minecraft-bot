@@ -1,0 +1,156 @@
+
+name: Minecraft Bot Android APK
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Validate and build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # Node 22 is used for CI tools and dependency installation only.
+      # It does NOT upgrade the Node.js version embedded inside nodejs-mobile.
+      - name: Set up Node.js for build tools
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: nodejs-assets/nodejs-project/package-lock.json
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;25.1.8937393"
+
+      - name: Generate React Native Android host
+        run: |
+          npx --yes @react-native-community/cli@12.3.6 init NativeApp \
+            --version 0.73.11 \
+            --skip-install
+
+      - name: Copy application and recovered engine
+        run: |
+          cp App.tsx index.js app.json babel.config.js metro.config.js tsconfig.json NativeApp/
+          cp package.json NativeApp/package.json
+          mkdir -p NativeApp/nodejs-assets
+          cp -R nodejs-assets/nodejs-project NativeApp/nodejs-assets/
+          cp -R android-native NativeApp/
+          cp -R scripts NativeApp/
+
+      - name: Install React Native dependencies
+        working-directory: NativeApp
+        run: npm install --legacy-peer-deps
+
+      - name: Install recovered Minecraft bot dependencies
+        working-directory: NativeApp/nodejs-assets/nodejs-project
+        run: npm ci --omit=dev --ignore-scripts=false
+
+      - name: Validate JavaScript sources
+        working-directory: NativeApp/nodejs-assets/nodejs-project
+        run: |
+          node --check bootstrap.js
+          node --check main.js
+          node --check bedrock-client.js
+          node --check microsoft-auth.js
+
+      - name: Type-check React Native application
+        working-directory: NativeApp
+        run: npm run typecheck
+
+      - name: Report embedded runtime compatibility
+        working-directory: NativeApp
+        shell: bash
+        run: |
+          echo "### Embedded Node.js runtime compatibility" >> "$GITHUB_STEP_SUMMARY"
+          echo "The CI Node.js 22 installation is only a build-time tool." >> "$GITHUB_STEP_SUMMARY"
+          echo "The current nodejs-mobile-react-native dependency embeds Node.js 18.20.4." >> "$GITHUB_STEP_SUMMARY"
+          echo "The recovered Mineflayer dependency tree requires Node.js 22 or newer." >> "$GITHUB_STEP_SUMMARY"
+          echo "**A successful APK compilation does not prove that the bot can join a server.**" >> "$GITHUB_STEP_SUMMARY"
+          node -e "const p=require('./package.json'); console.log('nodejs-mobile-react-native:',p.dependencies['nodejs-mobile-react-native'])"
+
+      - name: Patch Android foreground service
+        working-directory: NativeApp
+        run: python3 scripts/patch-generated-android.py .
+
+      - name: Bundle React Native JavaScript for standalone APK
+        working-directory: NativeApp
+        run: |
+          mkdir -p android/app/src/main/assets
+          npx react-native bundle \
+            --platform android \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output android/app/src/main/assets/index.android.bundle \
+            --assets-dest android/app/src/main/res
+
+      - name: Configure Gradle memory
+        run: |
+          printf '\norg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g\nandroid.useAndroidX=true\n' \
+            >> NativeApp/android/gradle.properties
+
+      - name: Build Debug APK
+        working-directory: NativeApp/android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon clean assembleDebug
+
+      - name: Verify APK output
+        run: |
+          APK="NativeApp/android/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          sha256sum "$APK"
+          ls -lh "$APK"
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Minecraft-Bot-Android-Debug
+          path: NativeApp/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Minecraft-Bot-Build-Logs
+          path: |
+            NativeApp/android/app/build/outputs/logs/
+            NativeApp/nodejs-assets/nodejs-project/package.json
+          if-no-files-found: ignore
+          retention-days: 7
+          
